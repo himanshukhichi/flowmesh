@@ -1,0 +1,12 @@
+target/
+.mvn/wrapper/maven-wrapper.jar
+
+.idea/
+.vscode/
+*.iml
+
+.DS_Store
+*.log
+
+docker/postgres-data/
+docker/kafka-data/

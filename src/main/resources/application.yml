@@ -1,0 +1,32 @@
+spring:
+  application:
+    name: flowmesh
+  datasource:
+    url: jdbc:postgresql://localhost:5432/flowmesh
+    username: flowmesh
+    password: flowmesh
+  flyway:
+    enabled: true
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+
+flowmesh:
+  scheduler:
+    enabled: false
+    batch-size: 50
+    poll-delay-ms: 1000

@@ -1,0 +1,24 @@
+dagId: daily-pipeline-yaml
+name: Daily Pipeline YAML
+tasks:
+  - taskId: extract
+    type: http_call
+    dependsOn: []
+    config:
+      url: https://example.test/source
+    timeoutSecs: 60
+    retries: 3
+  - taskId: transform
+    type: ml_inference
+    dependsOn: [extract]
+    config:
+      model: feature-normalizer
+    timeoutSecs: 180
+    retries: 3
+  - taskId: load
+    type: sql_query
+    dependsOn: [transform]
+    config:
+      sql: insert into pipeline_results select * from staging_results
+    timeoutSecs: 120
+    retries: 3
