@@ -57,6 +57,8 @@ public class DagValidationService {
                     );
                 }
             }
+            validateBranchReference(tasksById, task, task.successBranch(), "success_branch");
+            validateBranchReference(tasksById, task, task.failureBranch(), "failure_branch");
         }
 
         cycleDetector.findCycle(tasksById).ifPresent(path -> {
@@ -77,6 +79,36 @@ public class DagValidationService {
                 executionOrder,
                 initialReadyTaskIds
         );
+    }
+
+    private void validateBranchReference(
+            Map<String, TaskDefinition> tasksById,
+            TaskDefinition task,
+            String branchTaskId,
+            String branchName
+    ) {
+        if (branchTaskId == null) {
+            return;
+        }
+        if (!tasksById.containsKey(branchTaskId)) {
+            throw new DagValidationException(
+                    "UNKNOWN_BRANCH",
+                    "Task '" + task.taskId() + "' has unknown " + branchName + " task '" + branchTaskId + "'"
+            );
+        }
+        if (task.taskId().equals(branchTaskId)) {
+            throw new DagValidationException(
+                    "INVALID_BRANCH",
+                    "Task '" + task.taskId() + "' cannot branch to itself"
+            );
+        }
+        if (!tasksById.get(branchTaskId).dependsOn().contains(task.taskId())) {
+            throw new DagValidationException(
+                    "INVALID_BRANCH",
+                    "Task '" + task.taskId() + "' " + branchName + " target '" + branchTaskId
+                            + "' must depend on '" + task.taskId() + "'"
+            );
+        }
     }
 
     private Map<String, List<String>> buildDependents(Map<String, TaskDefinition> tasksById) {

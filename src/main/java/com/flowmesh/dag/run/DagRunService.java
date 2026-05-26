@@ -20,6 +20,7 @@ public class DagRunService {
     private final DagDefinitionRepository dagDefinitionRepository;
     private final DagRunRepository dagRunRepository;
     private final TaskRunRepository taskRunRepository;
+    private final TaskStateMachineService taskStateMachineService;
     private final DagValidationService dagValidationService;
     private final ObjectMapper objectMapper;
 
@@ -27,17 +28,19 @@ public class DagRunService {
             DagDefinitionRepository dagDefinitionRepository,
             DagRunRepository dagRunRepository,
             TaskRunRepository taskRunRepository,
+            TaskStateMachineService taskStateMachineService,
             DagValidationService dagValidationService,
             ObjectMapper objectMapper
     ) {
         this.dagDefinitionRepository = dagDefinitionRepository;
         this.dagRunRepository = dagRunRepository;
         this.taskRunRepository = taskRunRepository;
+        this.taskStateMachineService = taskStateMachineService;
         this.dagValidationService = dagValidationService;
         this.objectMapper = objectMapper;
     }
 
-    @Transactional
+    @Transactional(transactionManager = "transactionManager")
     public DagRunResponse createRun(String dagId, Integer requestedVersion) {
         DagDefinitionEntity definitionEntity = findDefinition(dagId, requestedVersion);
         DagDefinition definition = readDefinition(definitionEntity);
@@ -49,8 +52,13 @@ public class DagRunService {
 
         Set<String> initiallyReady = new LinkedHashSet<>(validatedDag.initialReadyTaskIds());
         definition.tasks().forEach(task -> {
-            TaskState initialState = initiallyReady.contains(task.taskId()) ? TaskState.PENDING : TaskState.CREATED;
-            taskRunRepository.save(TaskRunEntity.create(run, task, initialState));
+            TaskRunEntity taskRun = taskRunRepository.save(TaskRunEntity.create(
+                    run,
+                    task,
+                    TaskState.CREATED,
+                    writeJson(task.config())
+            ));
+            taskStateMachineService.transition(taskRun, TaskState.PENDING, "dag_run_created");
         });
 
         return new DagRunResponse(
@@ -80,6 +88,14 @@ public class DagRunService {
             return objectMapper.readValue(definitionEntity.getDefinitionJson(), DagDefinition.class);
         } catch (JsonProcessingException exception) {
             throw new IllegalStateException("Persisted DAG definition is not readable", exception);
+        }
+    }
+
+    private String writeJson(Object value) {
+        try {
+            return objectMapper.writeValueAsString(value);
+        } catch (JsonProcessingException exception) {
+            throw new IllegalStateException("Unable to serialize task config", exception);
         }
     }
 }

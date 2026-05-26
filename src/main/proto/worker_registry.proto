@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package flowmesh.worker;
+
+option java_multiple_files = true;
+option java_package = "com.flowmesh.grpc";
+option java_outer_classname = "WorkerRegistryProto";
+
+service WorkerRegistry {
+  rpc RegisterWorker (WorkerRegistrationRequest) returns (WorkerRegistrationResponse);
+  rpc Heartbeat (WorkerHeartbeatRequest) returns (WorkerHeartbeatResponse);
+}
+
+message WorkerRegistrationRequest {
+  string worker_id = 1;
+  repeated string supported_task_types = 2;
+  int32 max_concurrent = 3;
+}
+
+message WorkerRegistrationResponse {
+  bool accepted = 1;
+  string message = 2;
+}
+
+message WorkerHeartbeatRequest {
+  string worker_id = 1;
+  string dag_run_id = 2;
+  string task_id = 3;
+  string status = 4;
+  int64 observed_at_epoch_millis = 5;
+}
+
+message WorkerHeartbeatResponse {
+  bool accepted = 1;
+}

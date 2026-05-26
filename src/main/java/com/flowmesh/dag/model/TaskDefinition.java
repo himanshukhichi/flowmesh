@@ -1,6 +1,7 @@
 package com.flowmesh.dag.model;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonAlias;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
 
@@ -17,7 +18,9 @@ public record TaskDefinition(
         List<@NotBlank String> dependsOn,
         Map<String, Object> config,
         @Min(1) Integer timeoutSecs,
-        @Min(0) Integer retries
+        @Min(0) Integer retries,
+        @JsonAlias("success_branch") String successBranch,
+        @JsonAlias("failure_branch") String failureBranch
 ) {
     public static final int DEFAULT_TIMEOUT_SECS = 300;
     public static final int DEFAULT_RETRIES = 3;
@@ -27,5 +30,7 @@ public record TaskDefinition(
         config = config == null ? Map.of() : Collections.unmodifiableMap(new LinkedHashMap<>(config));
         timeoutSecs = timeoutSecs == null ? DEFAULT_TIMEOUT_SECS : timeoutSecs;
         retries = retries == null ? DEFAULT_RETRIES : retries;
+        successBranch = successBranch == null || successBranch.isBlank() ? null : successBranch;
+        failureBranch = failureBranch == null || failureBranch.isBlank() ? null : failureBranch;
     }
 }

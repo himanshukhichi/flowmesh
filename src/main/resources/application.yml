@@ -5,6 +5,12 @@ spring:
     url: jdbc:postgresql://localhost:5432/flowmesh
     username: flowmesh
     password: flowmesh
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      repositories:
+        enabled: false
   flyway:
     enabled: true
   jackson:
@@ -18,6 +24,34 @@ spring:
       hibernate:
         jdbc:
           time_zone: UTC
+  kafka:
+    bootstrap-servers: localhost:29092
+    admin:
+      auto-create: false
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      transaction-id-prefix: flowmesh-${HOSTNAME:local}-${random.uuid}-
+      properties:
+        enable.idempotence: true
+        acks: all
+    consumer:
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
+      auto-offset-reset: earliest
+      properties:
+        spring.json.trusted.packages: com.flowmesh.*
+        isolation.level: read_committed
+    listener:
+      ack-mode: record
+
+grpc:
+  server:
+    port: 9091
+
+logging:
+  pattern:
+    level: "%5p [dagRunId=%X{dagRunId:-} taskId=%X{taskId:-} workerId=%X{workerId:-}]"
 
 management:
   endpoints:
@@ -29,4 +63,27 @@ flowmesh:
   scheduler:
     enabled: false
     batch-size: 50
+    heartbeat-timeout-secs: 30
     poll-delay-ms: 1000
+    leader-renew-ms: 5000
+    timeout-scan-delay-ms: 5000
+  worker:
+    enabled: false
+    supported-task-types:
+      - http_call
+      - sql_query
+      - ml_inference
+    max-concurrent: 4
+    scheduler-grpc-host: localhost
+    scheduler-grpc-port: 9091
+    heartbeat-ms: 10000
+  dlq:
+    consumer-enabled: false
+  retry:
+    consumer-enabled: false
+  outbox:
+    batch-size: 50
+    publish-delay-ms: 500
+  observability:
+    kafka-depth-enabled: false
+    kafka-depth-scan-ms: 10000

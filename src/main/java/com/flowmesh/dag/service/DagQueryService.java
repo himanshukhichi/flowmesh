@@ -25,7 +25,7 @@ public class DagQueryService {
         this.objectMapper = objectMapper;
     }
 
-    @Transactional(readOnly = true)
+    @Transactional(transactionManager = "transactionManager", readOnly = true)
     public DagVersionResponse getLatestVersion(String dagId) {
         DagDefinitionEntity entity = dagDefinitionRepository.findTopByDagIdOrderByVersionDesc(dagId)
                 .orElseThrow(() -> new DagValidationException("DAG_NOT_FOUND", "DAG '" + dagId + "' was not found"));

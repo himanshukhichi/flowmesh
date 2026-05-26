@@ -26,7 +26,7 @@ public class DagSubmissionService {
         this.objectMapper = objectMapper;
     }
 
-    @Transactional
+    @Transactional(transactionManager = "transactionManager")
     public DagSubmissionResponse submit(DagDefinition definition) {
         ValidatedDag validatedDag = dagValidationService.validate(definition);
         int nextVersion = dagDefinitionRepository.findTopByDagIdOrderByVersionDesc(definition.dagId())
