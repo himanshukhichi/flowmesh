@@ -247,6 +247,70 @@ Why separate scheduler and worker roles:
 - Worker instances execute task payloads.
 - Scaling them independently mirrors real production systems. You may need more workers for CPU-heavy task execution, or more scheduler capacity for many small tasks.
 
+<details>
+<summary>Important snippet: default role toggles in application.yml</summary>
+
+```yaml
+flowmesh:
+  scheduler:
+    enabled: false
+    batch-size: 50
+    heartbeat-timeout-secs: 30
+    poll-delay-ms: 1000
+    leader-renew-ms: 5000
+    timeout-scan-delay-ms: 5000
+  worker:
+    enabled: false
+    supported-task-types:
+      - http_call
+      - sql_query
+      - ml_inference
+    max-concurrent: 4
+  dlq:
+    consumer-enabled: false
+  retry:
+    consumer-enabled: false
+```
+
+Why this snippet matters:
+
+- The jar starts in API-only mode by default.
+- Scheduler, worker, retry, and DLQ roles are opt-in.
+
+</details>
+
+<details>
+<summary>Important snippet: Compose runs separate scheduler and worker roles</summary>
+
+```yaml
+scheduler:
+  <<: *flowmesh-app
+  environment:
+    <<: *flowmesh-env
+    FLOWMESH_SCHEDULER_ENABLED: "true"
+    FLOWMESH_WORKER_ENABLED: "false"
+  ports:
+    - "8080:8080"
+    - "9091:9091"
+
+worker-1:
+  <<: *flowmesh-app
+  environment:
+    <<: *flowmesh-env
+    FLOWMESH_SCHEDULER_ENABLED: "false"
+    FLOWMESH_WORKER_ENABLED: "true"
+    FLOWMESH_WORKER_WORKER_ID: worker-1
+    FLOWMESH_WORKER_SCHEDULER_GRPC_HOST: scheduler
+    FLOWMESH_WORKER_SCHEDULER_GRPC_PORT: 9091
+```
+
+Why this snippet matters:
+
+- Same image, different role flags.
+- Workers connect to scheduler gRPC using the Compose service name.
+
+</details>
+
 ## DAG Definition Model
 
 ### `DagDefinition`
@@ -269,6 +333,30 @@ Why immutable-like records:
 
 - Definitions should not be mutated once parsed.
 - Immutable data is easier to reason about in validation and persistence.
+
+<details>
+<summary>Important snippet: immutable DAG definition record</summary>
+
+```java
+@JsonIgnoreProperties(ignoreUnknown = true)
+public record DagDefinition(
+        @NotBlank String dagId,
+        @NotBlank String name,
+        @NotEmpty @Valid List<TaskDefinition> tasks
+) {
+    public DagDefinition {
+        tasks = tasks == null ? List.of() : Collections.unmodifiableList(new ArrayList<>(tasks));
+    }
+}
+```
+
+Why this snippet matters:
+
+- Bean validation catches missing `dagId`, `name`, and empty task lists.
+- `@Valid` cascades validation into each `TaskDefinition`.
+- The constructor defensively copies the task list and makes it unmodifiable.
+
+</details>
 
 ### `TaskDefinition`
 
@@ -302,6 +390,43 @@ Tradeoff:
 
 - Flexible config improves extensibility.
 - Runtime validation is weaker than strongly typed task-specific config classes.
+
+<details>
+<summary>Important snippet: task defaults, config, dependencies, and branch aliases</summary>
+
+```java
+@JsonIgnoreProperties(ignoreUnknown = true)
+public record TaskDefinition(
+        @NotBlank String taskId,
+        @NotBlank String type,
+        List<@NotBlank String> dependsOn,
+        Map<String, Object> config,
+        @Min(1) Integer timeoutSecs,
+        @Min(0) Integer retries,
+        @JsonAlias("success_branch") String successBranch,
+        @JsonAlias("failure_branch") String failureBranch
+) {
+    public static final int DEFAULT_TIMEOUT_SECS = 300;
+    public static final int DEFAULT_RETRIES = 3;
+
+    public TaskDefinition {
+        dependsOn = dependsOn == null ? List.of() : Collections.unmodifiableList(new ArrayList<>(dependsOn));
+        config = config == null ? Map.of() : Collections.unmodifiableMap(new LinkedHashMap<>(config));
+        timeoutSecs = timeoutSecs == null ? DEFAULT_TIMEOUT_SECS : timeoutSecs;
+        retries = retries == null ? DEFAULT_RETRIES : retries;
+        successBranch = successBranch == null || successBranch.isBlank() ? null : successBranch;
+        failureBranch = failureBranch == null || failureBranch.isBlank() ? null : failureBranch;
+    }
+}
+```
+
+Why this snippet matters:
+
+- Defaults are applied at the boundary, so downstream code can assume timeout and retry values exist.
+- JSON aliases let API payloads use `success_branch` and Java code use `successBranch`.
+- The task `type` later becomes the Kafka topic suffix and handler lookup key.
+
+</details>
 
 ### Branching Semantics
 
@@ -385,6 +510,90 @@ What happens in detail:
 6. It saves a new immutable version with `version = latest + 1`, or `1` if this is new.
 7. The persisted entity stores the original definition JSON and precomputed execution order JSON.
 
+<details>
+<summary>Important snippet: JSON and YAML API entry points</summary>
+
+```java
+@PostMapping(path = "/dags", consumes = MediaType.APPLICATION_JSON_VALUE)
+public DagSubmissionResponse submitJson(@Valid @RequestBody DagDefinition definition) {
+    return dagSubmissionService.submit(definition);
+}
+
+@PostMapping(path = "/dags", consumes = {APPLICATION_YAML, APPLICATION_X_YAML, TEXT_YAML})
+public DagSubmissionResponse submitYaml(@RequestBody String yaml) {
+    DagDefinition definition = dagDefinitionParser.parseYaml(yaml);
+    validate(definition);
+    return dagSubmissionService.submit(definition);
+}
+```
+
+Why this snippet matters:
+
+- JSON submission uses Spring/Jackson body binding directly.
+- YAML submission parses a raw string first, then manually runs Bean Validation.
+- Both paths converge into the same `DagSubmissionService.submit` method.
+
+</details>
+
+<details>
+<summary>Important snippet: YAML parser keeps the same DAG model</summary>
+
+```java
+public DagDefinition parseYaml(String yaml) {
+    try {
+        return yamlMapper.readValue(yaml, DagDefinition.class);
+    } catch (JsonProcessingException exception) {
+        throw new DagValidationException("INVALID_DAG", "Unable to parse DAG YAML");
+    }
+}
+```
+
+Why this snippet matters:
+
+- YAML is treated as another input format, not a separate domain model.
+- Parser failures become API-friendly `DagValidationException` errors.
+
+</details>
+
+<details>
+<summary>Important snippet: immutable version creation</summary>
+
+```java
+@Transactional(transactionManager = "transactionManager")
+public DagSubmissionResponse submit(DagDefinition definition) {
+    ValidatedDag validatedDag = dagValidationService.validate(definition);
+    int nextVersion = dagDefinitionRepository.findTopByDagIdOrderByVersionDesc(definition.dagId())
+            .map(existing -> existing.getVersion() + 1)
+            .orElse(1);
+
+    DagDefinitionEntity entity = DagDefinitionEntity.create(
+            definition.dagId(),
+            nextVersion,
+            definition.name(),
+            writeJson(definition),
+            writeJson(validatedDag.executionOrder())
+    );
+    DagDefinitionEntity saved = dagDefinitionRepository.save(entity);
+
+    return new DagSubmissionResponse(
+            saved.getDagId(),
+            saved.getVersion(),
+            saved.getName(),
+            definition.tasks().size(),
+            validatedDag.executionOrder(),
+            saved.getCreatedAt()
+    );
+}
+```
+
+Why this snippet matters:
+
+- Validation runs before persistence.
+- Version number is derived from the latest persisted version.
+- The execution order is stored with the definition for fast inspection.
+
+</details>
+
 Why immutable versioning matters:
 
 - Suppose version 1 has `extract -> load`.
@@ -427,6 +636,88 @@ Why return more than just "valid":
 - Scheduling and UI responses often need graph-derived metadata.
 - Computing once during validation avoids duplicated graph code.
 - It makes tests easier because validation output can be asserted directly.
+
+<details>
+<summary>Important snippet: building task lookup, rejecting duplicates, and producing graph metadata</summary>
+
+```java
+Map<String, TaskDefinition> tasksById = new LinkedHashMap<>();
+for (TaskDefinition task : definition.tasks()) {
+    if (task.taskId() == null || task.taskId().isBlank()) {
+        throw new DagValidationException("INVALID_TASK", "Task id is required");
+    }
+    if (task.type() == null || task.type().isBlank()) {
+        throw new DagValidationException("INVALID_TASK", "Task type is required for task '" + task.taskId() + "'");
+    }
+    if (tasksById.putIfAbsent(task.taskId(), task) != null) {
+        throw new DagValidationException(
+                "DUPLICATE_TASK_ID",
+                "Task id '" + task.taskId() + "' is declared more than once"
+        );
+    }
+}
+
+cycleDetector.findCycle(tasksById).ifPresent(path -> {
+    throw new CycleDetectedException(path);
+});
+
+List<String> executionOrder = topologicalSorter.sort(tasksById);
+Map<String, List<String>> dependentsByTaskId = buildDependents(tasksById);
+List<String> initialReadyTaskIds = tasksById.values().stream()
+        .filter(task -> task.dependsOn().isEmpty())
+        .map(TaskDefinition::taskId)
+        .toList();
+```
+
+Why this snippet matters:
+
+- `tasksById` is the central lookup used for dependency and branch validation.
+- Cycle detection and topological sort are separate components, keeping graph logic focused.
+- `initialReadyTaskIds` are just tasks with no dependencies; actual scheduling readiness is later handled by SQL.
+
+</details>
+
+<details>
+<summary>Important snippet: branch target validation</summary>
+
+```java
+private void validateBranchReference(
+        Map<String, TaskDefinition> tasksById,
+        TaskDefinition task,
+        String branchTaskId,
+        String branchName
+) {
+    if (branchTaskId == null) {
+        return;
+    }
+    if (!tasksById.containsKey(branchTaskId)) {
+        throw new DagValidationException(
+                "UNKNOWN_BRANCH",
+                "Task '" + task.taskId() + "' has unknown " + branchName + " task '" + branchTaskId + "'"
+        );
+    }
+    if (task.taskId().equals(branchTaskId)) {
+        throw new DagValidationException(
+                "INVALID_BRANCH",
+                "Task '" + task.taskId() + "' cannot branch to itself"
+        );
+    }
+    if (!tasksById.get(branchTaskId).dependsOn().contains(task.taskId())) {
+        throw new DagValidationException(
+                "INVALID_BRANCH",
+                "Task '" + task.taskId() + "' " + branchName + " target '" + branchTaskId
+                        + "' must depend on '" + task.taskId() + "'"
+        );
+    }
+}
+```
+
+Why this snippet matters:
+
+- Branch targets must be downstream of the branching task.
+- That rule lets the scheduler implement branch decisions through dependency readiness.
+
+</details>
 
 ## Graph Algorithms
 
@@ -472,6 +763,58 @@ Why cycle detection is mandatory:
 - A DAG must be acyclic.
 - If cycles were allowed, tasks could wait forever for dependencies that can never complete first.
 
+<details>
+<summary>Important snippet: DFS cycle detection with a recursion stack</summary>
+
+```java
+private Optional<List<String>> dfs(
+        String taskId,
+        Map<String, TaskDefinition> tasksById,
+        Map<String, VisitState> stateByTaskId,
+        List<String> stack,
+        Map<String, Integer> stackIndexByTaskId
+) {
+    stateByTaskId.put(taskId, VisitState.VISITING);
+    stackIndexByTaskId.put(taskId, stack.size());
+    stack.add(taskId);
+
+    for (String dependencyId : tasksById.get(taskId).dependsOn()) {
+        VisitState dependencyState = stateByTaskId.get(dependencyId);
+        if (dependencyState == VisitState.VISITING) {
+            int cycleStart = stackIndexByTaskId.get(dependencyId);
+            List<String> cycle = new ArrayList<>(stack.subList(cycleStart, stack.size()));
+            cycle.add(dependencyId);
+            return Optional.of(cycle);
+        }
+
+        if (dependencyState == null) {
+            Optional<List<String>> cycle = dfs(
+                    dependencyId,
+                    tasksById,
+                    stateByTaskId,
+                    stack,
+                    stackIndexByTaskId
+            );
+            if (cycle.isPresent()) {
+                return cycle;
+            }
+        }
+    }
+
+    stack.remove(stack.size() - 1);
+    stackIndexByTaskId.remove(taskId);
+    stateByTaskId.put(taskId, VisitState.VISITED);
+    return Optional.empty();
+}
+```
+
+Why this snippet matters:
+
+- `VISITING` means the task is on the current path.
+- Seeing another `VISITING` task creates a precise cycle path for the API response.
+
+</details>
+
 ### Topological Sort
 
 Class: `TopologicalSorter`
@@ -496,6 +839,42 @@ Important distinction:
 - Topological order is not the exact runtime order.
 - Runtime order is affected by worker availability, Kafka partitioning, retries, timeouts, branches, and pause flags.
 
+<details>
+<summary>Important snippet: Kahn topological sort</summary>
+
+```java
+Queue<String> ready = new ArrayDeque<>();
+inDegreeByTaskId.forEach((taskId, inDegree) -> {
+    if (inDegree == 0) {
+        ready.add(taskId);
+    }
+});
+
+List<String> orderedTaskIds = new ArrayList<>(tasksById.size());
+while (!ready.isEmpty()) {
+    String taskId = ready.remove();
+    orderedTaskIds.add(taskId);
+
+    for (String dependentId : dependentsByTaskId.get(taskId)) {
+        int nextInDegree = inDegreeByTaskId.computeIfPresent(dependentId, (ignored, current) -> current - 1);
+        if (nextInDegree == 0) {
+            ready.add(dependentId);
+        }
+    }
+}
+
+if (orderedTaskIds.size() != tasksById.size()) {
+    throw new DagValidationException("INVALID_DAG", "Topological sort failed because the DAG is cyclic");
+}
+```
+
+Why this snippet matters:
+
+- Zero in-degree tasks are ready because they have no unmet dependencies.
+- If all nodes cannot be ordered, the graph is cyclic or invalid.
+
+</details>
+
 ## Persistence Model
 
 The database is the system of record.
@@ -513,6 +892,66 @@ The database is the system of record.
 | `task_dispatch_outbox` | Outbound Kafka messages waiting to publish |
 | `dlq_tasks` | Failed tasks requiring manual attention |
 | `worker_registrations` | Registered workers and heartbeat state |
+
+<details>
+<summary>Important snippet: immutable DAG definition table</summary>
+
+```sql
+create table dag_definitions (
+    id uuid primary key,
+    dag_id varchar(120) not null,
+    version integer not null,
+    name varchar(240) not null,
+    definition_json jsonb not null,
+    execution_order_json jsonb not null,
+    created_at timestamptz not null,
+    constraint uk_dag_definitions_dag_id_version unique (dag_id, version)
+);
+
+create index idx_dag_definitions_dag_id on dag_definitions (dag_id);
+```
+
+Why this snippet matters:
+
+- `(dag_id, version)` uniqueness enforces immutable version identity.
+- JSONB stores the submitted definition and computed execution order.
+
+</details>
+
+<details>
+<summary>Important snippet: task run and dependency tables</summary>
+
+```sql
+create table task_runs (
+    id uuid primary key,
+    dag_run_id uuid not null references dag_runs (id) on delete cascade,
+    task_id varchar(160) not null,
+    type varchar(120) not null,
+    state varchar(24) not null,
+    attempt integer not null,
+    timeout_secs integer not null,
+    retries integer not null,
+    created_at timestamptz not null,
+    queued_at timestamptz,
+    started_at timestamptz,
+    finished_at timestamptz,
+    updated_at timestamptz not null,
+    constraint uk_task_runs_dag_run_task unique (dag_run_id, task_id)
+);
+
+create table task_run_dependencies (
+    task_run_id uuid not null references task_runs (id) on delete cascade,
+    depends_on_task_id varchar(160) not null,
+    primary key (task_run_id, depends_on_task_id)
+);
+```
+
+Why this snippet matters:
+
+- `uk_task_runs_dag_run_task` makes `dagRunId + taskId` a stable lookup pair.
+- Dependencies are persisted relationally so readiness can be evaluated in SQL.
+
+</details>
 
 ### Why Store Dependencies Separately
 
@@ -599,6 +1038,48 @@ Important detail:
 
 All tasks become `PENDING`, not only root tasks. Readiness is decided later by the scheduler query. This is a good design because the database can be the single source for "is this task ready yet?"
 
+<details>
+<summary>Important snippet: creating a DAG run and task runs</summary>
+
+```java
+@Transactional(transactionManager = "transactionManager")
+public DagRunResponse createRun(String dagId, Integer requestedVersion) {
+    DagDefinitionEntity definitionEntity = findDefinition(dagId, requestedVersion);
+    DagDefinition definition = readDefinition(definitionEntity);
+    ValidatedDag validatedDag = dagValidationService.validate(definition);
+
+    DagRunEntity newRun = DagRunEntity.create(definitionEntity);
+    newRun.markRunning();
+    DagRunEntity run = dagRunRepository.save(newRun);
+
+    definition.tasks().forEach(task -> {
+        TaskRunEntity taskRun = taskRunRepository.save(TaskRunEntity.create(
+                run,
+                task,
+                TaskState.CREATED,
+                writeJson(task.config())
+        ));
+        taskStateMachineService.transition(taskRun, TaskState.PENDING, "dag_run_created");
+    });
+
+    return new DagRunResponse(
+            run.getId(),
+            run.getDagId(),
+            run.getVersion(),
+            run.getStatus(),
+            validatedDag.initialReadyTaskIds()
+    );
+}
+```
+
+Why this snippet matters:
+
+- A run pins one `DagDefinitionEntity`.
+- Every task gets a runtime row immediately.
+- The state machine records the first transition for every task.
+
+</details>
+
 ## Task State Machine
 
 Main class: `TaskStateMachineService`
@@ -649,6 +1130,88 @@ SWE2 point:
 
 A state machine is a simple but powerful reliability tool. It converts scattered boolean flags into explicit lifecycle rules.
 
+<details>
+<summary>Important snippet: allowed transitions map</summary>
+
+```java
+private static final Map<TaskState, Set<TaskState>> ALLOWED_TRANSITIONS = Map.of(
+        TaskState.CREATED, Set.of(TaskState.PENDING),
+        TaskState.PENDING, Set.of(TaskState.QUEUED),
+        TaskState.QUEUED, Set.of(TaskState.RUNNING),
+        TaskState.RUNNING, Set.of(TaskState.SUCCESS, TaskState.FAILED),
+        TaskState.FAILED, Set.of(TaskState.RETRYING, TaskState.DLQ),
+        TaskState.RETRYING, Set.of(TaskState.PENDING),
+        TaskState.DLQ, Set.of(TaskState.PENDING),
+        TaskState.SUCCESS, Set.of()
+);
+```
+
+Why this snippet matters:
+
+- The state machine explicitly defines legal lifecycle movement.
+- `SUCCESS` is terminal, while `DLQ` can be manually requeued to `PENDING`.
+
+</details>
+
+<details>
+<summary>Important snippet: transition enforcement and audit write</summary>
+
+```java
+public void transition(TaskRunEntity taskRun, TaskState nextState, String reason, String detailsJson) {
+    TaskState previousState = taskRun.getState();
+    if (!ALLOWED_TRANSITIONS.getOrDefault(previousState, Set.of()).contains(nextState)) {
+        throw new IllegalStateException(
+                "Invalid task state transition " + previousState + " -> " + nextState
+                        + " for task '" + taskRun.getTaskId() + "'"
+        );
+    }
+
+    taskRun.transitionTo(nextState);
+    transitionRepository.save(TaskStateTransitionEntity.create(
+            taskRun,
+            previousState,
+            nextState,
+            reason,
+            detailsJson
+    ));
+}
+```
+
+Why this snippet matters:
+
+- Invalid jumps fail fast.
+- Every valid transition produces timeline/audit data.
+
+</details>
+
+<details>
+<summary>Important snippet: task entity updates timestamps during transitions</summary>
+
+```java
+public void transitionTo(TaskState nextState) {
+    this.state = nextState;
+    Instant now = Instant.now();
+    if (nextState == TaskState.QUEUED) {
+        queuedAt = now;
+    } else if (nextState == TaskState.RUNNING) {
+        startedAt = now;
+        lastHeartbeatAt = now;
+    } else if (nextState == TaskState.SUCCESS || nextState == TaskState.FAILED || nextState == TaskState.DLQ) {
+        finishedAt = now;
+        workerId = null;
+    } else if (nextState == TaskState.RETRYING) {
+        workerId = null;
+    }
+}
+```
+
+Why this snippet matters:
+
+- State transitions also update operational fields like `queuedAt`, `startedAt`, and `finishedAt`.
+- Clearing `workerId` on terminal/retry states prevents stale worker ownership.
+
+</details>
+
 ## Scheduling In Depth
 
 Main classes:
@@ -674,6 +1237,70 @@ High-level scheduling loop:
 6. Transition each selected task `PENDING -> QUEUED`.
 7. Create an outbox row containing a `TaskMessage`.
 8. Record metrics and logs.
+
+<details>
+<summary>Important snippet: scheduled loop only runs on the leader</summary>
+
+```java
+@Scheduled(fixedDelayString = "${flowmesh.scheduler.poll-delay-ms:1000}")
+public void pollReadyTasks() {
+    if (!leaderElection.isLeader()) {
+        return;
+    }
+    List<TaskDispatch> dispatches = schedulingService.queueReadyTasks(batchSize);
+    for (TaskDispatch dispatch : dispatches) {
+        log.info(
+                "Queued task for dispatch dagRunId={} taskId={} topic={} idempotencyKey={}",
+                dispatch.dagRunId(),
+                dispatch.taskId(),
+                dispatch.topic(),
+                dispatch.idempotencyKey()
+        );
+    }
+}
+```
+
+Why this snippet matters:
+
+- All scheduler replicas may run this method, but only the leader does scheduling work.
+- Logging includes the dispatch topic and idempotency key for debugging.
+
+</details>
+
+<details>
+<summary>Important snippet: queueing ready tasks and writing to the publisher boundary</summary>
+
+```java
+@Transactional(transactionManager = "transactionManager")
+public List<TaskDispatch> queueReadyTasks(int limit) {
+    promoteDueRetries(limit);
+
+    List<TaskDispatch> dispatches = new ArrayList<>();
+    for (TaskRunEntity taskRun : taskRunRepository.lockReadyPendingTasks(limit)) {
+        if (pauseService.isPaused(taskRun.getDagRun().getDagId())) {
+            continue;
+        }
+
+        try (MdcScopes.Scope ignored = MdcScopes.task(taskRun.getDagRun().getId(), taskRun.getTaskId(), null)) {
+            stateMachineService.transition(taskRun, TaskState.QUEUED, "scheduler_ready");
+            TaskDispatch dispatch = TaskDispatch.from(taskRun);
+            taskPublisher.publish(toMessage(dispatch));
+            metrics.recordTaskScheduled();
+            recordSchedulingLatency(taskRun);
+            dispatches.add(dispatch);
+        }
+    }
+    return List.copyOf(dispatches);
+}
+```
+
+Why this snippet matters:
+
+- Retry promotion and fresh task dispatch happen in one scheduler pass.
+- The transaction covers the task transition and outbox enqueue.
+- Pause checks happen after locking ready tasks, so paused DAGs are simply left pending.
+
+</details>
 
 ### The Readiness Query
 
@@ -713,6 +1340,42 @@ A dependency permits the downstream task when:
 - The dependency failed and its failure branch points to this task.
 
 This implements conditional branching without a separate branch-routing table.
+
+<details>
+<summary>Important snippet: full ready-task locking query</summary>
+
+```java
+@Query(value = """
+        select tr.*
+        from task_runs tr
+        where tr.state = 'PENDING'
+          and (tr.next_attempt_at is null or tr.next_attempt_at <= now())
+          and not exists (
+              select 1
+              from task_run_dependencies dep
+              join task_runs dep_run
+                on dep_run.dag_run_id = tr.dag_run_id
+               and dep_run.task_id = dep.depends_on_task_id
+              where dep.task_run_id = tr.id
+                and not (
+                    (dep_run.state = 'SUCCESS'
+                        and (dep_run.success_branch_task_id is null or dep_run.success_branch_task_id = tr.task_id))
+                    or (dep_run.state = 'FAILED' and dep_run.failure_branch_task_id = tr.task_id)
+                )
+          )
+        order by tr.created_at
+        limit :limit
+        for update skip locked
+        """, nativeQuery = true)
+List<TaskRunEntity> lockReadyPendingTasks(@Param("limit") int limit);
+```
+
+Why this snippet matters:
+
+- This is the project's scheduling brain.
+- It combines retry timing, dependency satisfaction, branch routing, batching, and concurrency control.
+
+</details>
 
 ### Why `FOR UPDATE SKIP LOCKED`
 
@@ -765,6 +1428,38 @@ Why Redis:
 - It should be shared by all scheduler instances.
 - It does not need heavy relational modeling.
 
+<details>
+<summary>Important snippet: Redis-backed pause flags</summary>
+
+```java
+private static final String PAUSE_ALL_KEY = "flowmesh:scheduler:pause:all";
+private static final String PAUSE_DAG_PREFIX = "flowmesh:scheduler:pause:dag:";
+
+public void pauseAll() {
+    redisTemplate.opsForValue().set(PAUSE_ALL_KEY, "true");
+}
+
+public void resumeAll() {
+    redisTemplate.delete(PAUSE_ALL_KEY);
+}
+
+public void pauseDag(String dagId) {
+    redisTemplate.opsForValue().set(PAUSE_DAG_PREFIX + dagId, "true");
+}
+
+public boolean isPaused(String dagId) {
+    return Boolean.TRUE.equals(redisTemplate.hasKey(PAUSE_ALL_KEY))
+            || Boolean.TRUE.equals(redisTemplate.hasKey(PAUSE_DAG_PREFIX + dagId));
+}
+```
+
+Why this snippet matters:
+
+- Global and per-DAG pause are just shared Redis keys.
+- Scheduler instances read the same pause state.
+
+</details>
+
 ## Kafka Dispatch And The Outbox Pattern
 
 Main classes:
@@ -805,6 +1500,102 @@ Later:
 4. It marks the outbox row `SENT`.
 
 This decouples durable intent from actual Kafka delivery.
+
+<details>
+<summary>Important snippet: publisher writes outbox rows instead of sending Kafka directly</summary>
+
+```java
+@Override
+public void publish(TaskMessage message) {
+    enqueue(message.topic(), message.idempotencyKey(), TASK_PAYLOAD, message);
+}
+
+@Override
+public void publishRetry(RetryTaskMessage message) {
+    enqueue("tasks.retry", message.idempotencyKey(), RETRY_PAYLOAD, message);
+}
+
+@Override
+public void publishDlq(DlqTaskMessage message) {
+    enqueue("tasks.dlq", message.idempotencyKey(), DLQ_PAYLOAD, message);
+}
+
+private void enqueue(String topic, String key, String payloadType, Object message) {
+    outboxRepository.save(TaskDispatchOutboxEntity.create(topic, key, payloadType, writeJson(message)));
+}
+```
+
+Why this snippet matters:
+
+- The `TaskPublisher` abstraction hides the outbox implementation from scheduler/lifecycle code.
+- Task, retry, and DLQ events all use the same durable dispatch path.
+
+</details>
+
+<details>
+<summary>Important snippet: scheduled outbox publisher sends Kafka transactions</summary>
+
+```java
+@Scheduled(fixedDelayString = "${flowmesh.outbox.publish-delay-ms:500}")
+@Transactional(transactionManager = "transactionManager")
+public void publishPending() {
+    for (TaskDispatchOutboxEntity message : outboxRepository.lockPending(batchSize)) {
+        try {
+            sendTransactionally(message.getTopic(), message.getMessageKey(), readPayload(message));
+            message.markSent();
+        } catch (Exception exception) {
+            message.markPublishFailed(exception.getMessage());
+            log.warn("Kafka outbox publish failed topic={} key={}", message.getTopic(), message.getMessageKey(), exception);
+        }
+    }
+}
+
+private void sendTransactionally(String topic, String key, Object message) {
+    kafkaTemplate.executeInTransaction(operations -> {
+        try {
+            operations.send(topic, key, message).get(SEND_TIMEOUT_SECS, TimeUnit.SECONDS);
+            return null;
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while publishing Kafka message to " + topic, exception);
+        } catch (ExecutionException | TimeoutException exception) {
+            throw new IllegalStateException("Unable to publish Kafka message to " + topic, exception);
+        }
+    });
+}
+```
+
+Why this snippet matters:
+
+- Pending outbox rows are locked before publishing.
+- A successful Kafka send marks the row `SENT`.
+- A failure leaves the row retryable with backoff.
+
+</details>
+
+<details>
+<summary>Important snippet: outbox retry state</summary>
+
+```java
+public void markSent() {
+    this.state = OutboxState.SENT;
+    this.publishedAt = Instant.now();
+    this.errorMessage = null;
+}
+
+public void markPublishFailed(String errorMessage) {
+    this.publishAttempts += 1;
+    this.errorMessage = errorMessage;
+    this.nextAttemptAt = Instant.now().plus(Math.min(publishAttempts, 30), ChronoUnit.SECONDS);
+}
+```
+
+Why this snippet matters:
+
+- Outbox publishing has its own retry policy separate from task execution retries.
+- Failed publishes remain durable until retried.
+
+</details>
 
 ### Outbox Payload Types
 
@@ -867,6 +1658,35 @@ Why include both `taskRunId` and `dagRunId/taskId`:
 - `dagRunId + taskId` is a natural runtime lookup pair.
 - The code locks by `dagRunId + taskId`, which is unique in a run.
 
+<details>
+<summary>Important snippet: task message contract and topic derivation</summary>
+
+```java
+public record TaskMessage(
+        UUID dagRunId,
+        UUID taskRunId,
+        String taskId,
+        String type,
+        String configJson,
+        int attempt,
+        int timeoutSecs,
+        int retries,
+        String idempotencyKey,
+        String traceId
+) {
+    public String topic() {
+        return "tasks." + type;
+    }
+}
+```
+
+Why this snippet matters:
+
+- `type` drives Kafka routing and handler lookup.
+- `attempt` and `idempotencyKey` are what make worker processing duplicate-safe.
+
+</details>
+
 ### Idempotency Key
 
 Defined in `TaskRunEntity.idempotencyKey()`:
@@ -884,6 +1704,22 @@ Important retry detail:
 
 - On retry scheduling, the dedupe row is deleted so the next attempt can reserve execution again.
 - The task attempt number prevents stale retry messages from being accepted.
+
+<details>
+<summary>Important snippet: task idempotency key</summary>
+
+```java
+public String idempotencyKey() {
+    return dagRun.getId() + ":" + taskId;
+}
+```
+
+Why this snippet matters:
+
+- The key represents one logical task inside one DAG run.
+- Duplicate deliveries for the same task compete on the same dedupe record.
+
+</details>
 
 ## Worker Execution Flow
 
@@ -946,6 +1782,25 @@ Why topic-per-task-type:
 - Heavy ML workers do not need to consume SQL tasks.
 - Kafka partitioning can scale independently per task category.
 
+<details>
+<summary>Important snippet: worker topics are derived from supported task types</summary>
+
+```java
+@Bean("workerTaskTopics")
+String[] workerTaskTopics(WorkerProperties properties) {
+    return properties.supportedTaskTypes().stream()
+            .map(type -> "tasks." + type)
+            .toArray(String[]::new);
+}
+```
+
+Why this snippet matters:
+
+- Worker subscriptions are configuration-driven.
+- Adding or removing supported task types changes which Kafka topics a worker consumes.
+
+</details>
+
 ### Consumer Group
 
 Workers use group id:
@@ -975,6 +1830,56 @@ This means one worker process can run multiple Kafka listener threads.
 SWE2 point:
 
 Concurrency is both a throughput feature and a correctness risk. The code uses database locks, idempotency reservations, and attempt checks to protect shared state.
+
+<details>
+<summary>Important snippet: Kafka worker consumes, starts, executes, and completes a task</summary>
+
+```java
+@KafkaListener(
+        topics = "#{@workerTaskTopics}",
+        groupId = "${flowmesh.worker.group-id:flowmesh-workers}",
+        concurrency = "${flowmesh.worker.max-concurrent:4}"
+)
+public void consume(TaskMessage message) throws Exception {
+    if (!supportedTypes.contains(message.type())) {
+        log.debug("Skipping unsupported task type {}", message.type());
+        return;
+    }
+
+    try (MdcScopes.Scope ignored = MdcScopes.task(message.dagRunId(), message.taskId(), properties.workerId())) {
+        boolean shouldExecute = lifecycleService.startTask(message, properties.workerId());
+        if (!shouldExecute) {
+            log.info("Skipping duplicate or already-running task idempotencyKey={}", message.idempotencyKey());
+            return;
+        }
+
+        Instant startedAt = Instant.now();
+        runtimeState.started(message);
+        try {
+            JsonNode config = objectMapper.readTree(message.configJson());
+            TaskHandlerResult result = handlerRegistry.handlerFor(message.type())
+                    .execute(new TaskContext(message, config));
+            if (result.success()) {
+                lifecycleService.completeSuccess(message, properties.workerId(), startedAt);
+            } else {
+                lifecycleService.completeFailure(message, properties.workerId(), result.message());
+            }
+        } catch (Exception exception) {
+            lifecycleService.completeFailure(message, properties.workerId(), exception.getMessage());
+        } finally {
+            runtimeState.finished(message);
+        }
+    }
+}
+```
+
+Why this snippet matters:
+
+- Worker execution is wrapped by lifecycle calls, not just handler execution.
+- Duplicate/stale messages are rejected before the handler runs.
+- `runtimeState` feeds heartbeat reporting.
+
+</details>
 
 ## Handler Registry
 
@@ -1009,6 +1914,70 @@ Why use a registry:
 - New task types can be added by creating a new handler bean.
 - The orchestration layer stays generic.
 
+<details>
+<summary>Important snippet: handler interface and registry lookup</summary>
+
+```java
+public interface TaskHandler {
+    String type();
+
+    TaskHandlerResult execute(TaskContext context) throws Exception;
+}
+
+@Component
+public class TaskHandlerRegistry {
+    private final Map<String, TaskHandler> handlersByType;
+
+    public TaskHandlerRegistry(List<TaskHandler> handlers) {
+        this.handlersByType = handlers.stream()
+                .collect(Collectors.toUnmodifiableMap(TaskHandler::type, Function.identity()));
+    }
+
+    public TaskHandler handlerFor(String type) {
+        TaskHandler handler = handlersByType.get(type);
+        if (handler == null) {
+            throw new IllegalArgumentException("No task handler registered for type '" + type + "'");
+        }
+        return handler;
+    }
+}
+```
+
+Why this snippet matters:
+
+- Spring discovers handlers automatically.
+- The worker does not need an `if/else` chain for task types.
+
+</details>
+
+<details>
+<summary>Important snippet: demo handler failure switch</summary>
+
+```java
+@Component
+public class HttpCallTaskHandler implements TaskHandler {
+    @Override
+    public String type() {
+        return "http_call";
+    }
+
+    @Override
+    public TaskHandlerResult execute(TaskContext context) {
+        if (context.config().path("fail").asBoolean(false)) {
+            return TaskHandlerResult.failure("http_call configured to fail");
+        }
+        return TaskHandlerResult.success("http_call completed");
+    }
+}
+```
+
+Why this snippet matters:
+
+- The handler shape is intentionally simple.
+- The `"fail": true` config lets you test failure, retry, and DLQ paths.
+
+</details>
+
 How to add a real task type:
 
 1. Add a handler implementing `TaskHandler`.
@@ -1041,6 +2010,40 @@ Why each check exists:
 - Idempotency check blocks duplicate Kafka delivery.
 - Row lock serializes competing workers.
 
+<details>
+<summary>Important snippet: duplicate-safe worker start</summary>
+
+```java
+@Transactional(transactionManager = "transactionManager")
+public boolean startTask(TaskMessage message, String workerId) {
+    TaskRunEntity taskRun = lockTask(message);
+    if (taskRun.getState() != TaskState.QUEUED || taskRun.getAttempt() != message.attempt()) {
+        return false;
+    }
+
+    if (deduplicationRepository.existsById(message.idempotencyKey())) {
+        return false;
+    }
+    deduplicationRepository.save(TaskDeduplicationEntity.create(
+            message.idempotencyKey(),
+            message.dagRunId(),
+            message.taskId(),
+            workerId
+    ));
+
+    taskRun.assignWorker(workerId);
+    stateMachineService.transition(taskRun, TaskState.RUNNING, "worker_started", details(workerId, null));
+    return true;
+}
+```
+
+Why this snippet matters:
+
+- This is where duplicate Kafka delivery is stopped before handler side effects.
+- State, attempt, and idempotency checks all protect different failure modes.
+
+</details>
+
 ### Completing Successfully
 
 `completeSuccess(message, workerId, startedAt)`:
@@ -1066,6 +2069,67 @@ Why failed branch tasks are not DLQ immediately:
 
 - In a branching DAG, failure may be an expected path.
 - The failed task becomes the condition that allows its failure branch target to run.
+
+<details>
+<summary>Important snippet: failure routing to retry, branch, or DLQ</summary>
+
+```java
+private void handleFailure(
+        TaskRunEntity taskRun,
+        TaskMessage message,
+        String workerId,
+        String errorMessage,
+        String reason
+) {
+    taskRun.recordFailure(errorMessage);
+    stateMachineService.transition(taskRun, TaskState.FAILED, reason, details(workerId, errorMessage));
+
+    if (taskRun.hasRetriesRemaining()) {
+        long delayMillis = retryDelayMillis(taskRun.getAttempt());
+        taskRun.markRetrying(delayMillis, errorMessage);
+        stateMachineService.transition(taskRun, TaskState.RETRYING, "retry_scheduled", details(workerId, errorMessage));
+        deduplicationRepository.deleteById(message.idempotencyKey());
+        metrics.recordRetry();
+        taskPublisher.publishRetry(new RetryTaskMessage(
+                message.dagRunId(),
+                message.taskRunId(),
+                message.taskId(),
+                message.type(),
+                taskRun.getAttempt(),
+                taskRun.getNextAttemptAt().toEpochMilli(),
+                errorMessage,
+                message.idempotencyKey(),
+                message.traceId()
+        ));
+        return;
+    }
+
+    if (taskRun.getFailureBranchTaskId() != null) {
+        return;
+    }
+
+    stateMachineService.transition(taskRun, TaskState.DLQ, "retry_exhausted", details(workerId, errorMessage));
+    metrics.recordDlq();
+    taskPublisher.publishDlq(new DlqTaskMessage(
+            message.dagRunId(),
+            message.taskRunId(),
+            message.taskId(),
+            message.type(),
+            message.configJson(),
+            errorMessage,
+            message.idempotencyKey(),
+            message.traceId()
+    ));
+}
+```
+
+Why this snippet matters:
+
+- Retries are tried before a failure branch is taken.
+- A configured failure branch prevents automatic DLQ after retries are exhausted.
+- Retry and DLQ events both go through the outbox-backed publisher.
+
+</details>
 
 ## Retry Behavior
 
@@ -1105,6 +2169,51 @@ Important detail:
 The retry topic is not what makes the task executable again. The database is. `SchedulingService.promoteDueRetries` scans `RETRYING` tasks whose `next_attempt_at` has elapsed and transitions them back to `PENDING`.
 
 The `RetryTopicConsumer` currently logs retry events. It is useful for observability, but retry scheduling is driven by the DB state.
+
+<details>
+<summary>Important snippet: retry attempt increment and backoff timestamp</summary>
+
+```java
+public void markRetrying(long delayMillis, String errorMessage) {
+    this.attempt += 1;
+    this.errorMessage = errorMessage;
+    this.nextAttemptAt = Instant.now().plus(delayMillis, ChronoUnit.MILLIS);
+}
+
+public void markPendingForRetry() {
+    this.nextAttemptAt = null;
+}
+
+public boolean hasRetriesRemaining() {
+    return attempt < retries;
+}
+```
+
+Why this snippet matters:
+
+- The task row itself tracks retry attempt and retry timing.
+- `markPendingForRetry` clears the delay once the scheduler promotes the task.
+
+</details>
+
+<details>
+<summary>Important snippet: scheduler promotes due retries back to pending</summary>
+
+```java
+private void promoteDueRetries(int limit) {
+    for (TaskRunEntity taskRun : taskRunRepository.lockDueRetryingTasks(limit)) {
+        taskRun.markPendingForRetry();
+        stateMachineService.transition(taskRun, TaskState.PENDING, "retry_backoff_elapsed");
+    }
+}
+```
+
+Why this snippet matters:
+
+- Retry scheduling is database-driven.
+- After backoff elapses, the normal ready-task query can queue the task again.
+
+</details>
 
 ## Dead-Letter Queue
 
@@ -1146,6 +2255,60 @@ Why DLQ exists:
 - It prevents permanently failing tasks from blocking automated pipelines silently.
 - It gives operators a place to inspect payloads and errors.
 - It allows manual recovery after fixing external systems or bad configuration.
+
+<details>
+<summary>Important snippet: DLQ Kafka consumer persists failed task context</summary>
+
+```java
+@KafkaListener(topics = "tasks.dlq", groupId = "${flowmesh.dlq.group-id:flowmesh-dlq}")
+public void consume(DlqTaskMessage message) {
+    dlqService.record(message);
+}
+
+@Transactional(transactionManager = "transactionManager")
+public void record(DlqTaskMessage message) {
+    dlqTaskRepository.save(DlqTaskEntity.create(
+            message.dagRunId(),
+            message.taskId(),
+            message.type(),
+            message.idempotencyKey(),
+            message.payloadJson(),
+            message.errorMessage()
+    ));
+}
+```
+
+Why this snippet matters:
+
+- DLQ messages are durable both in Kafka and then in PostgreSQL.
+- Operators can inspect failed task context through the admin API.
+
+</details>
+
+<details>
+<summary>Important snippet: manual DLQ requeue</summary>
+
+```java
+@Transactional(transactionManager = "transactionManager")
+public DlqTaskResponse requeue(UUID dlqTaskId) {
+    DlqTaskEntity dlqTask = dlqTaskRepository.findById(dlqTaskId)
+            .orElseThrow(() -> new IllegalArgumentException("DLQ task not found: " + dlqTaskId));
+    TaskRunEntity taskRun = taskRunRepository.lockByDagRunIdAndTaskId(dlqTask.getDagRunId(), dlqTask.getTaskId())
+            .orElseThrow(() -> new IllegalArgumentException("Task run not found for DLQ task " + dlqTaskId));
+    deduplicationRepository.deleteById(dlqTask.getIdempotencyKey());
+    taskRun.markPendingForRetry();
+    stateMachineService.transition(taskRun, TaskState.PENDING, "dlq_manual_requeue");
+    dlqTask.markRequeued();
+    return DlqTaskResponse.from(dlqTask);
+}
+```
+
+Why this snippet matters:
+
+- Requeue clears dedupe state so the task can execute again.
+- The task re-enters the normal scheduler path as `PENDING`.
+
+</details>
 
 ## Worker Registration And Heartbeats
 
@@ -1206,6 +2369,95 @@ Why heartbeats matter:
 - They expose worker status for operations.
 - They are a foundation for smarter worker assignment later.
 
+<details>
+<summary>Important snippet: gRPC worker registry contract</summary>
+
+```proto
+service WorkerRegistry {
+  rpc RegisterWorker (WorkerRegistrationRequest) returns (WorkerRegistrationResponse);
+  rpc Heartbeat (WorkerHeartbeatRequest) returns (WorkerHeartbeatResponse);
+}
+
+message WorkerRegistrationRequest {
+  string worker_id = 1;
+  repeated string supported_task_types = 2;
+  int32 max_concurrent = 3;
+}
+
+message WorkerHeartbeatRequest {
+  string worker_id = 1;
+  string dag_run_id = 2;
+  string task_id = 3;
+  string status = 4;
+  int64 observed_at_epoch_millis = 5;
+}
+```
+
+Why this snippet matters:
+
+- The worker/scheduler service boundary is explicitly versioned in protobuf.
+- Registration describes capability; heartbeat describes liveness and current work.
+
+</details>
+
+<details>
+<summary>Important snippet: worker sends idle or running heartbeats</summary>
+
+```java
+@Scheduled(fixedDelayString = "${flowmesh.worker.heartbeat-ms:10000}")
+public void heartbeat() {
+    if (!registered.get()) {
+        ensureRegistered();
+    }
+    if (!registered.get()) {
+        return;
+    }
+
+    var currentTasks = runtimeState.currentTasks();
+    if (currentTasks.isEmpty()) {
+        sendHeartbeat(null, "IDLE");
+        return;
+    }
+
+    for (TaskMessage currentTask : currentTasks) {
+        sendHeartbeat(currentTask, "RUNNING");
+    }
+}
+```
+
+Why this snippet matters:
+
+- Heartbeats are tied to worker runtime state.
+- A worker with concurrent tasks sends one heartbeat per running task.
+
+</details>
+
+<details>
+<summary>Important snippet: scheduler records heartbeat against the task run</summary>
+
+```java
+@Override
+public void heartbeat(
+        WorkerHeartbeatRequest request,
+        StreamObserver<WorkerHeartbeatResponse> responseObserver
+) {
+    String taskId = request.getTaskId().isBlank() ? null : request.getTaskId();
+    workerRegistryService.heartbeat(request.getWorkerId(), taskId);
+    if (taskId != null && !request.getDagRunId().isBlank()) {
+        taskLifecycleService.recordHeartbeat(request.getDagRunId(), taskId, request.getWorkerId());
+    }
+    responseObserver.onNext(WorkerHeartbeatResponse.newBuilder().setAccepted(true).build());
+    responseObserver.onCompleted();
+}
+```
+
+Why this snippet matters:
+
+- Worker registry and task heartbeat timestamps are updated together.
+- Timeout enforcement later depends on `last_heartbeat_at`.
+
+</details>
+
 ## Timeout Enforcement
 
 Main class: `TaskTimeoutEnforcer`
@@ -1232,6 +2484,41 @@ Why use the same failure path:
 SWE2 point:
 
 Timeout enforcement is a control-loop pattern. The system does not rely only on workers to report failure, because dead workers cannot report anything.
+
+<details>
+<summary>Important snippet: timeout and heartbeat expiry scans</summary>
+
+```java
+@Scheduled(fixedDelayString = "${flowmesh.scheduler.timeout-scan-delay-ms:5000}")
+@Transactional(transactionManager = "transactionManager")
+public void enforceTimeouts() {
+    if (!leaderElection.isLeader()) {
+        return;
+    }
+
+    Set<UUID> handled = new LinkedHashSet<>();
+    for (TaskRunEntity taskRun : taskRunRepository.lockTimedOutRunningTasks(batchSize)) {
+        handled.add(taskRun.getId());
+        log.warn("Task timed out dagRunId={} taskId={}", taskRun.getDagRun().getId(), taskRun.getTaskId());
+        taskLifecycleService.failRunningTask(taskRun, "Task timed out after " + taskRun.getTimeoutSecs() + "s", "task_timeout");
+    }
+
+    for (TaskRunEntity taskRun : taskRunRepository.lockHeartbeatExpiredTasks(heartbeatTimeoutSecs, batchSize)) {
+        if (handled.contains(taskRun.getId())) {
+            continue;
+        }
+        log.warn("Task heartbeat expired dagRunId={} taskId={}", taskRun.getDagRun().getId(), taskRun.getTaskId());
+        taskLifecycleService.failRunningTask(taskRun, "Worker heartbeat expired", "heartbeat_expired");
+    }
+}
+```
+
+Why this snippet matters:
+
+- Only the scheduler leader enforces timeouts.
+- The `handled` set avoids failing the same task twice if it matches both timeout rules.
+
+</details>
 
 ## Leader Election
 
@@ -1263,6 +2550,44 @@ The class name says Redlock, but this implementation uses a single Redis lock wi
 SWE2 discussion:
 
 Be ready to discuss split-brain risk, clock/latency concerns, lock TTL choice, idempotent scheduler design, and why database row locks still matter even with leader election.
+
+<details>
+<summary>Important snippet: Redis TTL lock acquisition and renewal</summary>
+
+```java
+private static final String LOCK_KEY = "flowmesh:scheduler:leader";
+private static final DefaultRedisScript<Long> RENEW_SCRIPT = new DefaultRedisScript<>(
+        "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('pexpire', KEYS[1], ARGV[2]) else return 0 end",
+        Long.class
+);
+
+private final AtomicBoolean leader = new AtomicBoolean(false);
+private final String token = UUID.randomUUID().toString();
+private final Duration ttl = Duration.ofSeconds(10);
+
+@Scheduled(fixedDelayString = "${flowmesh.scheduler.leader-renew-ms:5000}")
+public void renewOrAcquire() {
+    if (leader.get() && renew()) {
+        return;
+    }
+
+    Boolean acquired = redisTemplate.opsForValue().setIfAbsent(LOCK_KEY, token, ttl);
+    boolean nowLeader = Boolean.TRUE.equals(acquired);
+    boolean changed = leader.getAndSet(nowLeader) != nowLeader;
+    if (changed || nowLeader) {
+        metrics.recordLeaderElectionEvent();
+        log.info("Scheduler leader status changed leader={}", nowLeader);
+    }
+}
+```
+
+Why this snippet matters:
+
+- `setIfAbsent` acquires leadership only when no valid lock exists.
+- The token prevents an instance from renewing a lock owned by another scheduler.
+- The TTL lets another scheduler recover leadership if the current leader dies.
+
+</details>
 
 ## Conditional Branching
 
@@ -1335,6 +2660,25 @@ Why it matters:
 - It is much easier to debug than only looking at current task states.
 - It is useful for UI timelines and postmortems.
 
+<details>
+<summary>Important snippet: timeline endpoint maps transition rows to API events</summary>
+
+```java
+@GetMapping("/{dagRunId}/timeline")
+public List<TaskTimelineEvent> timeline(@PathVariable UUID dagRunId) {
+    return transitionRepository.findByDagRunIdOrderByTransitionedAtAsc(dagRunId).stream()
+            .map(TaskTimelineEvent::from)
+            .toList();
+}
+```
+
+Why this snippet matters:
+
+- Timeline events are already ordered by transition timestamp.
+- The endpoint is a thin read model over the audit table.
+
+</details>
+
 ### Metrics
 
 Main class: `FlowMeshMetrics`
@@ -1363,6 +2707,33 @@ Why gauges and counters both exist:
 - Gauges represent current values or windowed values.
 - Histograms/summaries capture latency distributions.
 
+<details>
+<summary>Important snippet: core metrics registration</summary>
+
+```java
+public FlowMeshMetrics(MeterRegistry registry) {
+    this.leaderElectionEvents = Counter.builder("leader_election_events_total").register(registry);
+    this.retryEvents = Counter.builder("retry_events_total").register(registry);
+    this.dlqEvents = Counter.builder("dlq_events_total").register(registry);
+    Gauge.builder("tasks_scheduled_per_sec", tasksScheduledPerSec, AtomicLong::get).register(registry);
+    Gauge.builder("retry_rate", retryRate, AtomicLong::get).register(registry);
+    Gauge.builder("dlq_rate", dlqRate, AtomicLong::get).register(registry);
+    Gauge.builder("kafka_queue_depth", kafkaQueueDepth, AtomicLong::get).register(registry);
+    this.schedulingLatency = DistributionSummary.builder("task_scheduling_latency_ms")
+            .baseUnit("milliseconds")
+            .publishPercentiles(0.99)
+            .publishPercentileHistogram()
+            .register(registry);
+}
+```
+
+Why this snippet matters:
+
+- Metric names are defined in one central component.
+- Scheduling latency is histogram-backed so P99 can be estimated in Prometheus.
+
+</details>
+
 ### Kafka Queue Depth
 
 Main class: `KafkaQueueDepthMonitor`
@@ -1381,6 +2752,28 @@ Why this matters:
 - Queue depth is a leading signal of worker saturation.
 - If scheduling rate is high and queue depth grows, workers are not keeping up.
 
+<details>
+<summary>Important snippet: queue depth chooses the right consumer group per topic</summary>
+
+```java
+private String groupForTopic(String topic) {
+    if ("tasks.retry".equals(topic)) {
+        return retryGroupId;
+    }
+    if ("tasks.dlq".equals(topic)) {
+        return dlqGroupId;
+    }
+    return workerGroupId;
+}
+```
+
+Why this snippet matters:
+
+- Normal task topics use the worker group.
+- Retry and DLQ topics have separate consumers, so their lag must be measured against different groups.
+
+</details>
+
 ### MDC Logging
 
 Main class: `MdcScopes`
@@ -1395,6 +2788,25 @@ Why:
 
 - Distributed logs are noisy.
 - MDC lets you filter all logs related to one task or run.
+
+<details>
+<summary>Important snippet: scoped MDC fields for task logs</summary>
+
+```java
+public static Scope task(UUID dagRunId, String taskId, String workerId) {
+    put("dagRunId", dagRunId == null ? null : dagRunId.toString());
+    put("taskId", taskId);
+    put("workerId", workerId);
+    return MDC::clear;
+}
+```
+
+Why this snippet matters:
+
+- The helper makes contextual logging easy to apply with try-with-resources.
+- `MDC::clear` prevents one task's context from leaking into another log line.
+
+</details>
 
 ## API Surface
 
@@ -1545,6 +2957,31 @@ Why this demo matters:
 - It tests worker distribution because multiple workers share a consumer group.
 - It gives realistic operational dependencies without cloud infrastructure.
 
+<details>
+<summary>Important snippet: Kafka topic and transaction settings in Compose</summary>
+
+```yaml
+kafka:
+  image: apache/kafka:3.7.0
+  ports:
+    - "29092:29092"
+  environment:
+    KAFKA_NODE_ID: 1
+    KAFKA_PROCESS_ROLES: broker,controller
+    KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+    KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:29092
+    KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092
+    KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+    KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+```
+
+Why this snippet matters:
+
+- The Compose broker supports transactional Kafka producers.
+- Internal containers use `kafka:9092`; local tools use `localhost:29092`.
+
+</details>
+
 ## AWS ECS Scaffold
 
 File: `deploy/ecs/flowmesh-ecs.yml`
@@ -1571,6 +3008,47 @@ Why this is a scaffold:
 
 - It defines compute services, not managed database/Kafka/Redis resources.
 - Production deployment would also need networking, secrets, autoscaling, health checks, load balancing, and managed service provisioning.
+
+<details>
+<summary>Important snippet: ECS scheduler and worker services use the same image with different environment</summary>
+
+```yaml
+SchedulerTaskDefinition:
+  Type: AWS::ECS::TaskDefinition
+  Properties:
+    Family: flowmesh-scheduler
+    ContainerDefinitions:
+      - Name: scheduler
+        Image: !Ref ImageUri
+        PortMappings:
+          - ContainerPort: 8080
+          - ContainerPort: 9091
+        Environment:
+          - Name: FLOWMESH_SCHEDULER_ENABLED
+            Value: "true"
+          - Name: FLOWMESH_WORKER_ENABLED
+            Value: "false"
+
+WorkerTaskDefinition:
+  Type: AWS::ECS::TaskDefinition
+  Properties:
+    Family: flowmesh-worker
+    ContainerDefinitions:
+      - Name: worker
+        Image: !Ref ImageUri
+        Environment:
+          - Name: FLOWMESH_SCHEDULER_ENABLED
+            Value: "false"
+          - Name: FLOWMESH_WORKER_ENABLED
+            Value: "true"
+```
+
+Why this snippet matters:
+
+- The deployment mirrors Compose: one artifact, role-specific configuration.
+- Scheduler exposes API/gRPC; workers only need outbound dependencies.
+
+</details>
 
 ## Tests
 
@@ -1607,6 +3085,62 @@ What is missing for production-grade confidence:
 SWE2 point:
 
 The highest-risk code is usually transaction/concurrency code. For this project, that means readiness locking, outbox publishing, idempotent worker start, retries, and timeout enforcement.
+
+<details>
+<summary>Important snippet: validation test asserts cycle path</summary>
+
+```java
+@Test
+void detectsCycleAndReturnsCyclePath() {
+    DagDefinition definition = new DagDefinition(
+            "cyclic",
+            "Cyclic",
+            List.of(
+                    task("taskA", "taskB"),
+                    task("taskB", "taskA")
+            )
+    );
+
+    assertThatThrownBy(() -> service.validate(definition))
+            .isInstanceOfSatisfying(CycleDetectedException.class, exception -> {
+                assertThat(exception.error()).isEqualTo("CYCLE_DETECTED");
+                assertThat(exception.path()).containsExactly("taskA", "taskB", "taskA");
+            });
+}
+```
+
+Why this snippet matters:
+
+- The test verifies both behavior and the diagnostic payload.
+- Good tests assert what the API/user needs, not only that an exception occurred.
+
+</details>
+
+<details>
+<summary>Important snippet: lifecycle test proves stale attempts are rejected</summary>
+
+```java
+@Test
+void rejectsMessagesForStaleAttempts() {
+    TaskMessage message = message(0);
+    TaskRunEntity taskRun = taskRun(TaskState.QUEUED, 1, null);
+    when(taskRunRepository.lockByDagRunIdAndTaskId(message.dagRunId(), message.taskId()))
+            .thenReturn(Optional.of(taskRun));
+
+    boolean started = service.startTask(message, "worker-1");
+
+    assertThat(started).isFalse();
+    verify(deduplicationRepository, never()).save(any());
+    verify(stateMachineService, never()).transition(any(), any(), any(), any());
+}
+```
+
+Why this snippet matters:
+
+- Stale Kafka messages are expected in retry-heavy distributed systems.
+- The test confirms stale attempts do not reserve idempotency or transition state.
+
+</details>
 
 ## Important Design Tradeoffs
 
@@ -1714,6 +3248,32 @@ Possible improvement:
 - Add a `SKIPPED` task state for branch paths not taken.
 - Mark DAG run `SUCCESS` or `FAILED` accordingly.
 
+<details>
+<summary>Important snippet: DAG run currently has status fields but only markRunning behavior</summary>
+
+```java
+public class DagRunEntity {
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false, length = 24)
+    private DagRunStatus status;
+
+    @Column(name = "completed_at")
+    private Instant completedAt;
+
+    public void markRunning() {
+        this.status = DagRunStatus.RUNNING;
+        this.startedAt = Instant.now();
+    }
+}
+```
+
+Why this snippet matters:
+
+- The data model is ready for terminal run status.
+- The missing piece is aggregate completion logic that updates `status` and `completedAt`.
+
+</details>
+
 ### Worker Registry Is Informational
 
 Workers register supported types and concurrency, but scheduler currently dispatches by Kafka topic and does not use the registry for placement decisions.
@@ -1723,6 +3283,30 @@ Possible improvement:
 - Use registry data for capacity-aware scheduling.
 - Pause dispatch of a task type if no healthy worker supports it.
 - Expose worker health API.
+
+<details>
+<summary>Important snippet: worker registration stores capability and current status</summary>
+
+```java
+public void updateRegistration(String supportedTaskTypesJson, int maxConcurrent) {
+    this.supportedTaskTypesJson = supportedTaskTypesJson;
+    this.maxConcurrent = maxConcurrent;
+    this.status = "REGISTERED";
+}
+
+public void heartbeat(String currentTaskId) {
+    this.currentTaskId = currentTaskId;
+    this.lastHeartbeatAt = Instant.now();
+    this.status = currentTaskId == null || currentTaskId.isBlank() ? "IDLE" : "RUNNING";
+}
+```
+
+Why this snippet matters:
+
+- Capability and liveness data already exist.
+- Scheduler policy could use this table later for capacity-aware dispatch.
+
+</details>
 
 ### Demo Task Handlers
 
@@ -1744,6 +3328,29 @@ Possible improvement:
 - Keep it as an audit stream, or remove it if unnecessary.
 - Alternatively, make retry topic drive delayed requeue through a dedicated retry service.
 
+<details>
+<summary>Important snippet: retry topic consumer only logs retry events</summary>
+
+```java
+@KafkaListener(topics = "tasks.retry", groupId = "${flowmesh.retry.group-id:flowmesh-retry}")
+public void consume(RetryTaskMessage message) {
+    log.info(
+            "Retry scheduled dagRunId={} taskId={} nextAttempt={} notBeforeEpochMillis={}",
+            message.dagRunId(),
+            message.taskId(),
+            message.nextAttempt(),
+            message.notBeforeEpochMillis()
+    );
+}
+```
+
+Why this snippet matters:
+
+- It confirms retries are not requeued from this consumer.
+- The scheduler's DB scan is what makes due retries executable again.
+
+</details>
+
 ### No Authentication Or Authorization
 
 Admin endpoints can pause scheduling and requeue DLQ tasks.
@@ -1761,6 +3368,24 @@ Possible improvement:
 
 - Use `ObjectMapper` to serialize structured detail objects.
 - Avoid subtle escaping bugs.
+
+<details>
+<summary>Important snippet: manual transition details JSON construction</summary>
+
+```java
+private String details(String workerId, String errorMessage) {
+    String escapedWorker = workerId == null ? "" : workerId.replace("\"", "\\\"");
+    String escapedError = errorMessage == null ? "" : errorMessage.replace("\"", "\\\"");
+    return "{\"workerId\":\"" + escapedWorker + "\",\"errorMessage\":\"" + escapedError + "\"}";
+}
+```
+
+Why this snippet matters:
+
+- The code handles quotes but still manually constructs JSON.
+- A typed object serialized with `ObjectMapper` would be safer and easier to extend.
+
+</details>
 
 ### Single Redis Lock
 
